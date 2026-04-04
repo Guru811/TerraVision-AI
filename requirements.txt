@@ -1,0 +1,11 @@
+earthengine-api
+geemap
+streamlit
+folium
+streamlit-folium
+scikit-learn
+joblib
+numpy
+rasterio
+geopandas
+scipy
