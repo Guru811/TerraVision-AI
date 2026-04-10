@@ -1,34 +1,4 @@
-        # TerraVision Advanced Fire & Anomaly Classifier
-# Classifies satellite radiance clusters into five categories:
 
-#   1. natural_wildfire        – fast-spreading, high-radiance, irregular shape
-#   2. agricultural_burn       – seasonal, linear/rectangular, moderate radiance
-#   3. illegal_encroachment    – small persistent clusters, edge-of-forest, low-moderate radiance
-#   4. anomaly                 – industrial flare, gas leak, sensor artifact, urban heat
-#   5. unclassified            – insufficient evidence for any category
-
-# Detection pipeline
-#   Step 1 – Radiance delta map (current – baseline)
-#   Step 2 – Connected-component clustering (8-connected flood fill)
-#   Step 3 – Per-cluster feature extraction (15 features)
-#   Step 4 – Multi-stage rule engine with weighted scoring
-#   Step 5 – Confidence calibration & fallback to "anomaly"
-
-# Feature set extracted per cluster
-#   • delta_mean / delta_max / delta_std     – radiance statistics
-#   • cluster_size                           – pixel count
-#   • aspect_ratio                           – bounding-box W/H  (linearity proxy)
-#   • convexity                              – filled_area / convex_hull_area  (shape regularity)
-#   • compactness                            – 4π·area / perimeter²
-#   • edge_ratio                             – fraction of pixels on cluster boundary
-#   • perimeter                              – cluster perimeter length
-#   • spread_rate                            – size relative to bounding-box diagonal
-#   • centroid_row / centroid_col            – location
-#   • bbox_area                              – bounding-box pixel area
-#   • interior_uniformity                    – 1 – (std / mean)  inside cluster
-
-# Thresholds are defined in the PARAMS dataclass and can be tuned or
-# loaded from a JSON config without changing the logic.
 
 from __future__ import annotations
 

@@ -1,4 +1,26 @@
+# Python virtual environment — never upload this
 venv/
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Satellite data files — too large for GitHub (each file is 100MB+)
+# Download these locally by running gee_export.py
 *.tif
+*.tiff
+
+# Environment file containing your secret GEE Project ID
+# This must NEVER be pushed to GitHub
 .env
+
+# Google Earth Engine authentication tokens stored on your machine
+.config/
+earthengine/
+
+# VS Code settings
+.vscode/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
