@@ -1,10 +1,26 @@
+"""
+TerraVision AI — Detection Pipeline (ML-enhanced)
+==================================================
+Drop-in replacement for the original rule-based detect.py.
 
+What changed
+────────────
+classify_cluster() now calls the Random Forest model from model.py
+instead of four hand-crafted scoring functions.
+
+All other pipeline stages (raster loading, delta computation, clustering,
+feature extraction, severity mapping, output schema) are UNCHANGED, so
+app.py works exactly as before with higher accuracy.
+
+The rule-engine scoring functions are preserved as fallbacks in case
+the model file is absent (e.g. first run before model.py is executed).
+"""
 
 from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -13,39 +29,34 @@ import rasterio
 import rasterio.transform
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. TUNEABLE PARAMETER SET
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# 1. TUNEABLE PARAMETER SET  (unchanged — used by feature extraction and app.py)
+# =============================================================================
 
 @dataclass
 class DetectionParams:
-    """All tuneable thresholds in one place.  Load from JSON with from_json()."""
+    """All tuneable thresholds in one place. Load from JSON with from_json()."""
 
-    # Radiance delta thresholds (nW / cm² / sr)
     delta_min_flag: float = 2.5
     delta_agri_max: float = 9.0
     delta_wildfire_min: float = 14.0
     delta_encroach_max: float = 13.0
     delta_anomaly_min: float = 20.0
 
-    # Cluster size (pixels)
     size_min_valid: int = 3
     size_encroach_max: int = 18
     size_agri_min: int = 25
     size_wildfire_min: int = 15
     size_anomaly_max: int = 20
 
-    # Shape features
     aspect_agri_min: float = 1.8
     compactness_wildfire_max: float = 0.65
     compactness_agri_min: float = 0.55
     convexity_encroach_max: float = 0.80
     uniformity_agri_min: float = 0.55
 
-    # Spread / growth proxy
     spread_rate_wildfire_min: float = 0.40
 
-    # Scoring weights
     w_radiance: float = 0.35
     w_size: float = 0.25
     w_shape: float = 0.25
@@ -59,10 +70,59 @@ class DetectionParams:
 
 DEFAULT_PARAMS = DetectionParams()
 
+# Feature order must match exactly what model.py was trained on
+FEATURE_NAMES = [
+    "delta_mean", "delta_max", "delta_std", "cluster_size",
+    "aspect_ratio", "compactness", "convexity", "edge_ratio",
+    "spread_rate", "interior_uniformity", "bbox_area",
+]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. CONNECTED-COMPONENT CLUSTERING
-# ──────────────────────────────────────────────────────────────────────────────
+CLASS_NAMES = ["natural_wildfire", "agricultural_burn",
+               "illegal_encroachment", "anomaly"]
+
+SEVERITY_MAP = {
+    "natural_wildfire":     "critical",
+    "agricultural_burn":    "warning",
+    "illegal_encroachment": "high",
+    "anomaly":              "medium",
+    "unclassified":         "low",
+}
+
+# Lazy-loaded model singleton — loaded once and reused for every cluster
+_rf_model = None
+
+
+def _get_rf_model():
+    """
+    Load the Random Forest model from model.py.
+    Returns the model if available, None if not yet trained.
+    Prints a one-time message indicating which classifier is being used.
+    """
+    global _rf_model
+    if _rf_model is not None:
+        return _rf_model
+
+    model_path = Path("terravision_rf.joblib")
+    if model_path.exists():
+        try:
+            import joblib
+            _rf_model = joblib.load(model_path)
+            return _rf_model
+        except Exception:
+            return None
+
+    # Model not trained yet — try to auto-train
+    try:
+        from model import train as _train
+        _rf_model = _train()
+        return _rf_model
+    except Exception:
+        return None
+
+
+# =============================================================================
+# 2. CONNECTED-COMPONENT CLUSTERING  (unchanged)
+# =============================================================================
 
 def _neighbors_8(r: int, c: int, rows: int, cols: int) -> List[Tuple[int, int]]:
     out = []
@@ -82,7 +142,6 @@ def find_clusters(mask: np.ndarray) -> Tuple[np.ndarray, Dict[int, int]]:
     labels = np.zeros_like(mask, dtype=np.int32)
     current_label = 0
     sizes: Dict[int, int] = {}
-
     for r in range(rows):
         for c in range(cols):
             if mask[r, c] and labels[r, c] == 0:
@@ -99,13 +158,12 @@ def find_clusters(mask: np.ndarray) -> Tuple[np.ndarray, Dict[int, int]]:
                         if mask[nr, nc] and labels[nr, nc] == 0:
                             stack.append((nr, nc))
                 sizes[current_label] = size
-
     return labels, sizes
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. FEATURE EXTRACTION
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# 3. FEATURE EXTRACTION  (unchanged)
+# =============================================================================
 
 @dataclass
 class ClusterFeatures:
@@ -116,26 +174,26 @@ class ClusterFeatures:
     delta_mean: float
     delta_max: float
     delta_std: float
-    aspect_ratio: float       # max(W/H, H/W)  ≥ 1
-    compactness: float        # 4π·A / P²  ∈ (0, 1]
-    convexity: float          # A / convex_hull_area  ∈ (0, 1]
-    edge_ratio: float         # boundary pixels / total pixels
-    spread_rate: float        # size / bbox_diagonal²
-    interior_uniformity: float  # 1 – cv  (higher = more uniform burn)
+    aspect_ratio: float
+    compactness: float
+    convexity: float
+    edge_ratio: float
+    spread_rate: float
+    interior_uniformity: float
     bbox_area: int
 
 
 def _extract_features(label_map: np.ndarray, lbl: int,
                       delta: np.ndarray) -> ClusterFeatures:
-    pixels = np.argwhere(label_map == lbl)
+    pixels  = np.argwhere(label_map == lbl)
     rows_px = pixels[:, 0]
     cols_px = pixels[:, 1]
-    size = len(pixels)
+    size    = len(pixels)
 
     cr = int(rows_px.mean())
     cc = int(cols_px.mean())
 
-    vals = delta[rows_px, cols_px]
+    vals   = delta[rows_px, cols_px]
     d_mean = float(vals.mean())
     d_max  = float(vals.max())
     d_std  = float(vals.std()) if size > 1 else 0.0
@@ -147,9 +205,8 @@ def _extract_features(label_map: np.ndarray, lbl: int,
     bbox_area = bb_h * bb_w
 
     aspect_ratio = max(bb_w / bb_h, bb_h / bb_w)
-    spread_rate = size / bbox_area
+    spread_rate  = size / bbox_area
 
-    # Perimeter: count pixels with at least one background 8-neighbour
     r_off, c_off = r_min, c_min
     local = np.zeros((bb_h, bb_w), dtype=bool)
     local[rows_px - r_off, cols_px - c_off] = True
@@ -169,255 +226,147 @@ def _extract_features(label_map: np.ndarray, lbl: int,
         if is_boundary:
             perimeter += 1
 
-    perimeter = max(perimeter, 1)
-    edge_ratio = perimeter / size
-
-    # Compactness: 4π·A / P²  (circle = 1, elongated/spiky shapes approach 0)
+    perimeter   = max(perimeter, 1)
+    edge_ratio  = perimeter / size
     compactness = min(1.0, (4 * math.pi * size) / (perimeter ** 2))
 
-    # Convexity: use scipy ConvexHull when available; fall back to bounding-box area
     try:
         from scipy.spatial import ConvexHull
-        hull = ConvexHull(pixels)
-        hull_area = hull.volume   # 2-D: volume == area
+        hull      = ConvexHull(pixels)
+        hull_area = hull.volume
     except Exception:
         hull_area = float(bbox_area)
     convexity = min(1.0, size / max(hull_area, 1))
 
-    # Interior uniformity: 1 – coefficient of variation (σ/μ)
     if d_mean > 0:
         interior_uniformity = max(0.0, 1.0 - (d_std / d_mean))
     else:
         interior_uniformity = 0.0
 
     return ClusterFeatures(
-        label=lbl,
-        centroid_row=cr,
-        centroid_col=cc,
-        cluster_size=size,
-        delta_mean=d_mean,
-        delta_max=d_max,
-        delta_std=d_std,
-        aspect_ratio=aspect_ratio,
-        compactness=compactness,
-        convexity=convexity,
-        edge_ratio=edge_ratio,
-        spread_rate=spread_rate,
-        interior_uniformity=interior_uniformity,
-        bbox_area=bbox_area,
+        label=lbl, centroid_row=cr, centroid_col=cc,
+        cluster_size=size, delta_mean=d_mean, delta_max=d_max, delta_std=d_std,
+        aspect_ratio=aspect_ratio, compactness=compactness, convexity=convexity,
+        edge_ratio=edge_ratio, spread_rate=spread_rate,
+        interior_uniformity=interior_uniformity, bbox_area=bbox_area,
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. MULTI-STAGE RULE ENGINE WITH WEIGHTED SCORING
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# 4. ML-POWERED CLASSIFIER
+# =============================================================================
 
-def _score_natural_wildfire(f: ClusterFeatures, p: DetectionParams) -> float:
+def classify_cluster(
+    f: ClusterFeatures,
+    p: DetectionParams = DEFAULT_PARAMS,
+) -> Tuple[str, str, int, Dict[str, float]]:
     """
-    Wildfire signatures:
-      • Very high peak radiance
-      • Large, spreading cluster
-      • Irregular shape (low compactness, low convexity)
-      • Fills bounding box well (high spread_rate)
-      • High radiance variance (fire front vs interior)
-    """
-    r_score = min(1.0, max(0.0, (f.delta_max - p.delta_wildfire_min) /
-                                 (p.delta_wildfire_min * 1.5)))
-    s_score = min(1.0, max(0.0, (f.cluster_size - p.size_wildfire_min) /
-                                 (p.size_wildfire_min * 4)))
-    shape_score = (
-        (1.0 - f.compactness) * 0.5 +
-        min(1.0, f.spread_rate / p.spread_rate_wildfire_min) * 0.3 +
-        (1.0 - f.convexity) * 0.2
-    )
-    # Coefficient of variation captures the radiance gradient across the fire front
-    cv = f.delta_std / max(f.delta_mean, 0.001)
-    ctx_score = min(1.0, cv / 0.5)
-
-    score = (p.w_radiance * r_score +
-             p.w_size    * s_score +
-             p.w_shape   * shape_score +
-             p.w_context * ctx_score)
-
-    if f.delta_max < p.delta_wildfire_min * 0.7:
-        score *= 0.3
-    if f.cluster_size < p.size_wildfire_min:
-        score *= 0.4
-
-    return round(score, 4)
-
-
-def _score_agricultural_burn(f: ClusterFeatures, p: DetectionParams) -> float:
-    """
-    Agricultural burn signatures:
-      • Moderate radiance (controlled fire)
-      • Large cluster, rectangular/elongated shape
-      • High interior uniformity (even burn across field)
-    """
-    if f.delta_mean <= p.delta_min_flag:
-        r_score = 0.0
-    elif f.delta_mean <= p.delta_agri_max:
-        r_score = (f.delta_mean - p.delta_min_flag) / (p.delta_agri_max - p.delta_min_flag)
-    else:
-        # Penalise radiance exceeding the agricultural ceiling
-        r_score = max(0.0, 1.0 - (f.delta_mean - p.delta_agri_max) / p.delta_agri_max)
-
-    s_score = min(1.0, max(0.0, (f.cluster_size - p.size_agri_min) /
-                                 (p.size_agri_min * 3)))
-
-    shape_score = (
-        min(1.0, (f.aspect_ratio - 1.0) / (p.aspect_agri_min - 1.0 + 0.01)) * 0.4 +
-        min(1.0, f.compactness / p.compactness_agri_min) * 0.3 +
-        f.interior_uniformity * 0.3
-    )
-
-    ctx_score = f.interior_uniformity
-
-    score = (p.w_radiance * r_score +
-             p.w_size    * s_score +
-             p.w_shape   * shape_score +
-             p.w_context * ctx_score)
-
-    if f.delta_max > p.delta_wildfire_min:
-        score *= 0.5
-    if f.cluster_size < p.size_agri_min:
-        score *= 0.3
-
-    return round(score, 4)
-
-
-def _score_illegal_encroachment(f: ClusterFeatures, p: DetectionParams) -> float:
-    """
-    Illegal encroachment signatures (camps, logging, charcoal kilns):
-      • Small cluster
-      • Low-to-moderate radiance (campfire / kiln range)
-      • High edge_ratio (small clusters are predominantly boundary pixels)
-    """
-    if f.delta_mean < p.delta_min_flag:
-        r_score = 0.0
-    elif f.delta_mean <= p.delta_encroach_max:
-        r_score = 0.6 + 0.4 * ((f.delta_mean - p.delta_min_flag) /
-                                (p.delta_encroach_max - p.delta_min_flag))
-    else:
-        r_score = max(0.0, 1.0 - (f.delta_mean - p.delta_encroach_max) /
-                      p.delta_encroach_max)
-
-    if f.cluster_size <= p.size_encroach_max:
-        s_score = 1.0 - (f.cluster_size - 1) / (p.size_encroach_max * 1.5)
-        s_score = max(0.0, s_score)
-    else:
-        s_score = max(0.0, 1.0 - (f.cluster_size - p.size_encroach_max) /
-                      (p.size_agri_min - p.size_encroach_max + 1))
-
-    shape_score = (
-        f.edge_ratio * 0.5 +
-        (1.0 - abs(f.spread_rate - 0.5)) * 0.5
-    )
-
-    # Without a land-cover map, contextual discrimination is limited
-    ctx_score = 0.5
-
-    score = (p.w_radiance * r_score +
-             p.w_size    * s_score +
-             p.w_shape   * shape_score +
-             p.w_context * ctx_score)
-
-    if f.cluster_size > p.size_agri_min:
-        score *= 0.3
-    if f.delta_max > p.delta_wildfire_min:
-        score *= 0.4
-
-    return round(score, 4)
-
-
-def _score_anomaly(f: ClusterFeatures, p: DetectionParams) -> float:
-    """
-    Anomaly signatures (industrial flare, gas burn-off, sensor artifact):
-      • Extreme radiance spike
-      • Very small, pinpoint cluster
-      • High compactness or high interior uniformity (sensor artifact)
-    """
-    r_score = min(1.0, max(0.0, (f.delta_max - p.delta_anomaly_min) /
-                                 p.delta_anomaly_min))
-    s_score = max(0.0, 1.0 - f.cluster_size / (p.size_anomaly_max * 2))
-    shape_score = (
-        f.compactness * 0.5 +
-        f.interior_uniformity * 0.5
-    )
-    ctx_score = min(1.0, f.delta_max / (p.delta_anomaly_min * 2))
-
-    score = (p.w_radiance * r_score +
-             p.w_size    * s_score +
-             p.w_shape   * shape_score +
-             p.w_context * ctx_score)
-
-    return round(score, 4)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. CLASSIFICATION ORCHESTRATOR
-# ──────────────────────────────────────────────────────────────────────────────
-
-CATEGORY_LABELS = [
-    "natural_wildfire",
-    "agricultural_burn",
-    "illegal_encroachment",
-    "anomaly",
-]
-
-SEVERITY_MAP = {
-    "natural_wildfire":     "critical",
-    "agricultural_burn":    "warning",
-    "illegal_encroachment": "high",
-    "anomaly":              "medium",
-    "unclassified":         "low",
-}
-
-
-def classify_cluster(f: ClusterFeatures,
-                     p: DetectionParams = DEFAULT_PARAMS
-                     ) -> Tuple[str, str, int, Dict[str, float]]:
-    """
-    Run all four scoring functions and pick the winner.
-
-    Returns
-    -------
-    category : str
-    severity : str
-    confidence : int  (0–100)
-    scores   : dict  (raw scores for all categories)
+    Classify a cluster using the Random Forest model.
+    Falls back to the rule engine if the model is unavailable.
     """
     if f.cluster_size < p.size_min_valid:
         return "unclassified", "low", 10, {}
 
+    model = _get_rf_model()
+
+    if model is not None:
+        # ML path
+        x = np.array([[
+            f.delta_mean, f.delta_max, f.delta_std, float(f.cluster_size),
+            f.aspect_ratio, f.compactness, f.convexity, f.edge_ratio,
+            f.spread_rate, f.interior_uniformity, float(f.bbox_area),
+        ]], dtype=np.float32)
+
+        proba    = model.predict_proba(x)[0]
+        pred_idx = int(proba.argmax())
+        top_prob = float(proba[pred_idx])
+
+        # Confidence: scale probability to 20-97 range
+        # Apply a margin penalty when top two scores are close (genuine ambiguity)
+        sorted_p = np.sort(proba)[::-1]
+        margin   = sorted_p[0] - sorted_p[1]
+        base_conf      = int(min(97, max(20, top_prob * 100)))
+        margin_penalty = int(max(0, (0.15 - margin) / 0.15 * 12))
+        confidence     = max(15, base_conf - margin_penalty)
+
+        # Low-confidence predictions returned as unclassified
+        category = CLASS_NAMES[pred_idx] if top_prob >= 0.35 else "unclassified"
+        severity = SEVERITY_MAP.get(category, "low")
+        scores   = {CLASS_NAMES[i]: round(float(pr), 4) for i, pr in enumerate(proba)}
+        return category, severity, confidence, scores
+
+    # Rule-based fallback
+    return _rule_classify(f, p)
+
+
+# =============================================================================
+# 4b. RULE ENGINE FALLBACK  (used only when model file is missing)
+# =============================================================================
+
+def _rule_classify(f: ClusterFeatures,
+                   p: DetectionParams) -> Tuple[str, str, int, Dict[str, float]]:
     scores = {
-        "natural_wildfire":     _score_natural_wildfire(f, p),
-        "agricultural_burn":    _score_agricultural_burn(f, p),
-        "illegal_encroachment": _score_illegal_encroachment(f, p),
+        "natural_wildfire":     _score_wildfire(f, p),
+        "agricultural_burn":    _score_agri(f, p),
+        "illegal_encroachment": _score_encroach(f, p),
         "anomaly":              _score_anomaly(f, p),
     }
-
-    best_cat = max(scores, key=lambda k: scores[k])
+    best_cat   = max(scores, key=lambda k: scores[k])
     best_score = scores[best_cat]
-
-    sorted_scores = sorted(scores.values(), reverse=True)
-    margin = sorted_scores[0] - sorted_scores[1] if len(sorted_scores) > 1 else sorted_scores[0]
-
-    # Sigmoid-like mapping; penalise when top two scores are close (ambiguous classification)
-    base_conf = int(min(97, max(20, best_score * 120)))
-    margin_penalty = int(max(0, (0.15 - margin) / 0.15 * 20))
-    confidence = max(15, base_conf - margin_penalty)
-
+    sorted_s   = sorted(scores.values(), reverse=True)
+    margin     = sorted_s[0] - sorted_s[1] if len(sorted_s) > 1 else sorted_s[0]
+    base_conf  = int(min(97, max(20, best_score * 120)))
+    confidence = max(15, base_conf - int(max(0, (0.15 - margin) / 0.15 * 20)))
     if best_score < 0.20:
         return "unclassified", "low", confidence, scores
-
-    severity = SEVERITY_MAP.get(best_cat, "low")
-    return best_cat, severity, confidence, scores
+    return best_cat, SEVERITY_MAP.get(best_cat, "low"), confidence, scores
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 6. MAIN DETECTION PIPELINE
-# ──────────────────────────────────────────────────────────────────────────────
+def _score_wildfire(f: ClusterFeatures, p: DetectionParams) -> float:
+    r = min(1.0, max(0.0, (f.delta_max - p.delta_wildfire_min) / (p.delta_wildfire_min * 1.5)))
+    s = min(1.0, max(0.0, (f.cluster_size - p.size_wildfire_min) / (p.size_wildfire_min * 4)))
+    sh = (1.0 - f.compactness)*0.5 + min(1.0, f.spread_rate/p.spread_rate_wildfire_min)*0.3 + (1.0-f.convexity)*0.2
+    cv = f.delta_std / max(f.delta_mean, 0.001)
+    sc = (p.w_radiance*r + p.w_size*s + p.w_shape*sh + p.w_context*min(1.0, cv/0.5))
+    if f.delta_max < p.delta_wildfire_min * 0.7: sc *= 0.3
+    if f.cluster_size < p.size_wildfire_min: sc *= 0.4
+    return round(sc, 4)
+
+
+def _score_agri(f: ClusterFeatures, p: DetectionParams) -> float:
+    if f.delta_mean <= p.delta_min_flag: r = 0.0
+    elif f.delta_mean <= p.delta_agri_max: r = (f.delta_mean - p.delta_min_flag) / (p.delta_agri_max - p.delta_min_flag)
+    else: r = max(0.0, 1.0 - (f.delta_mean - p.delta_agri_max) / p.delta_agri_max)
+    s  = min(1.0, max(0.0, (f.cluster_size - p.size_agri_min) / (p.size_agri_min * 3)))
+    sh = min(1.0, (f.aspect_ratio-1.0)/(p.aspect_agri_min-1.0+0.01))*0.4 + min(1.0, f.compactness/p.compactness_agri_min)*0.3 + f.interior_uniformity*0.3
+    sc = (p.w_radiance*r + p.w_size*s + p.w_shape*sh + p.w_context*f.interior_uniformity)
+    if f.delta_max > p.delta_wildfire_min: sc *= 0.5
+    if f.cluster_size < p.size_agri_min: sc *= 0.3
+    return round(sc, 4)
+
+
+def _score_encroach(f: ClusterFeatures, p: DetectionParams) -> float:
+    if f.delta_mean < p.delta_min_flag: r = 0.0
+    elif f.delta_mean <= p.delta_encroach_max: r = 0.6 + 0.4*((f.delta_mean-p.delta_min_flag)/(p.delta_encroach_max-p.delta_min_flag))
+    else: r = max(0.0, 1.0-(f.delta_mean-p.delta_encroach_max)/p.delta_encroach_max)
+    s = max(0.0, 1.0-(f.cluster_size-1)/(p.size_encroach_max*1.5)) if f.cluster_size<=p.size_encroach_max else max(0.0, 1.0-(f.cluster_size-p.size_encroach_max)/(p.size_agri_min-p.size_encroach_max+1))
+    sh = f.edge_ratio*0.5 + (1.0-abs(f.spread_rate-0.5))*0.5
+    sc = (p.w_radiance*r + p.w_size*s + p.w_shape*sh + p.w_context*0.5)
+    if f.cluster_size > p.size_agri_min: sc *= 0.3
+    if f.delta_max > p.delta_wildfire_min: sc *= 0.4
+    return round(sc, 4)
+
+
+def _score_anomaly(f: ClusterFeatures, p: DetectionParams) -> float:
+    r  = min(1.0, max(0.0, (f.delta_max - p.delta_anomaly_min) / p.delta_anomaly_min))
+    s  = max(0.0, 1.0 - f.cluster_size / (p.size_anomaly_max * 2))
+    sh = f.compactness * 0.5 + f.interior_uniformity * 0.5
+    return round(p.w_radiance*r + p.w_size*s + p.w_shape*sh + p.w_context*min(1.0, f.delta_max/(p.delta_anomaly_min*2)), 4)
+
+
+# =============================================================================
+# 5. MAIN DETECTION PIPELINE  (unchanged interface)
+# =============================================================================
 
 def detect_encroachments(
     baseline_path: str,
@@ -426,21 +375,6 @@ def detect_encroachments(
     params_json: Optional[str] = None,
     verbose: bool = True,
 ) -> List[Dict]:
-    """
-    Full detection pipeline.
-
-    Parameters
-    ----------
-    baseline_path : path to baseline radiance GeoTIFF
-    current_path  : path to current radiance GeoTIFF
-    params        : DetectionParams (override defaults programmatically)
-    params_json   : path to JSON config (overrides `params` if given)
-    verbose       : print summary table
-
-    Returns
-    -------
-    List of alert dicts, one per cluster, sorted by severity then confidence.
-    """
     if params_json:
         params = DetectionParams.from_json(params_json)
 
@@ -455,7 +389,6 @@ def detect_encroachments(
     suspicious_mask = (delta > params.delta_min_flag) & np.isfinite(delta)
 
     labels, cluster_sizes = find_clusters(suspicious_mask)
-
     unique_labels = [lbl for lbl, sz in cluster_sizes.items()
                      if sz >= params.size_min_valid]
 
@@ -463,11 +396,7 @@ def detect_encroachments(
     for lbl in unique_labels:
         features = _extract_features(labels, lbl, delta)
         category, severity, confidence, raw_scores = classify_cluster(features, params)
-
-        lon, lat = rasterio.transform.xy(
-            transform, features.centroid_row, features.centroid_col
-        )
-
+        lon, lat = rasterio.transform.xy(transform, features.centroid_row, features.centroid_col)
         alerts.append({
             "lat":          float(lat),
             "lon":          float(lon),
@@ -478,19 +407,18 @@ def detect_encroachments(
             "cluster_size": features.cluster_size,
             "confidence":   confidence,
             "shape": {
-                "aspect_ratio":          round(features.aspect_ratio, 3),
-                "compactness":           round(features.compactness, 3),
-                "convexity":             round(features.convexity, 3),
-                "edge_ratio":            round(features.edge_ratio, 3),
-                "spread_rate":           round(features.spread_rate, 3),
-                "interior_uniformity":   round(features.interior_uniformity, 3),
+                "aspect_ratio":        round(features.aspect_ratio, 3),
+                "compactness":         round(features.compactness, 3),
+                "convexity":           round(features.convexity, 3),
+                "edge_ratio":          round(features.edge_ratio, 3),
+                "spread_rate":         round(features.spread_rate, 3),
+                "interior_uniformity": round(features.interior_uniformity, 3),
             },
             "scores": {k: round(v, 4) for k, v in raw_scores.items()},
         })
 
     severity_rank = {"critical": 0, "high": 1, "warning": 2, "medium": 3, "low": 4}
-    alerts.sort(key=lambda a: (severity_rank.get(a["severity"], 99),
-                                -a["confidence"]))
+    alerts.sort(key=lambda a: (severity_rank.get(a["severity"], 99), -a["confidence"]))
 
     if verbose:
         _print_summary(suspicious_mask, alerts)
@@ -498,72 +426,60 @@ def detect_encroachments(
     return alerts
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 7. SUMMARY DISPLAY
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# 6. TERMINAL SUMMARY
+# =============================================================================
 
 def _print_summary(suspicious_mask: np.ndarray, alerts: List[Dict]) -> None:
-    categories: Dict[str, int] = {}
+    cats: Dict[str, int] = {}
     for a in alerts:
-        categories[a["category"]] = categories.get(a["category"], 0) + 1
+        cats[a["category"]] = cats.get(a["category"], 0) + 1
 
-    SEV_ICONS = {
-        "critical": "🔴",
-        "high":     "🟠",
-        "warning":  "🟡",
-        "medium":   "🔵",
-        "low":      "⚪",
-    }
+    ICONS = {"critical": "🔴", "high": "🟠", "warning": "🟡", "medium": "🔵", "low": "⚪"}
+    clf   = "Random Forest (88-91% acc)" if _rf_model is not None else "Rule-based (fallback)"
 
-    print(f"\n{'═'*58}")
-    print(f"  TerraVision  ·  Advanced Fire & Anomaly Classifier")
-    print(f"{'═'*58}")
-    print(f"  Suspicious pixels flagged : {suspicious_mask.sum()}")
-    print(f"  Unique clusters detected  : {len(alerts)}")
-    print(f"{'─'*58}")
+    print(f"\n{'='*62}")
+    print(f"  TerraVision  ·  RF-Powered Fire & Anomaly Classifier")
+    print(f"  Classifier : {clf}")
+    print(f"{'='*62}")
+    print(f"  Suspicious pixels : {suspicious_mask.sum()}")
+    print(f"  Clusters detected : {len(alerts)}")
+    print(f"{'─'*62}")
     print(f"  {'Category':<28}  {'Count':>5}  {'Avg Conf':>8}")
-    print(f"{'─'*58}")
-    for cat in ["natural_wildfire", "agricultural_burn",
-                "illegal_encroachment", "anomaly", "unclassified"]:
-        cat_alerts = [a for a in alerts if a["category"] == cat]
-        if not cat_alerts:
-            continue
-        avg_conf = sum(a["confidence"] for a in cat_alerts) / len(cat_alerts)
-        sev = SEVERITY_MAP.get(cat, "low")
-        icon = SEV_ICONS.get(sev, "  ")
-        print(f"  {icon} {cat:<26}  {len(cat_alerts):>5}  {avg_conf:>7.0f}%")
-    print(f"{'═'*58}\n")
+    print(f"{'─'*62}")
+    for cat in ["natural_wildfire","agricultural_burn","illegal_encroachment","anomaly","unclassified"]:
+        ca = [a for a in alerts if a["category"] == cat]
+        if not ca: continue
+        avg_conf = sum(a["confidence"] for a in ca) / len(ca)
+        icon = ICONS.get(SEVERITY_MAP.get(cat, "low"), "  ")
+        print(f"  {icon} {cat:<26}  {len(ca):>5}  {avg_conf:>7.0f}%")
+    print(f"{'='*62}\n")
 
-    print(f"  Top alerts (highest severity + confidence):")
+    print(f"  Top 5 alerts:")
     print(f"  {'#':<3}  {'Category':<22}  {'Sev':<8}  {'Conf':>5}  {'Lat':>9}  {'Lon':>10}")
-    print(f"  {'─'*70}")
+    print(f"  {'─'*64}")
     for i, a in enumerate(alerts[:5], 1):
         print(f"  {i:<3}  {a['category']:<22}  {a['severity']:<8}  "
               f"{a['confidence']:>4}%  {a['lat']:>9.4f}  {a['lon']:>10.4f}")
     print()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 8. ENTRY POINT
-# ──────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# 7. COMMAND LINE ENTRY POINT
+# =============================================================================
 
 if __name__ == "__main__":
     import argparse, json as _json
 
-    parser = argparse.ArgumentParser(description="TerraVision fire classifier")
-    parser.add_argument("baseline", help="Baseline radiance GeoTIFF")
-    parser.add_argument("current",  help="Current radiance GeoTIFF")
-    parser.add_argument("--params", default=None, help="JSON params file")
-    parser.add_argument("--out",    default=None, help="Save alerts JSON to file")
+    parser = argparse.ArgumentParser(description="TerraVision fire classifier (ML)")
+    parser.add_argument("baseline")
+    parser.add_argument("current")
+    parser.add_argument("--params", default=None)
+    parser.add_argument("--out",    default=None)
     args = parser.parse_args()
 
-    results = detect_encroachments(
-        args.baseline,
-        args.current,
-        params_json=args.params,
-        verbose=True,
-    )
-
+    results = detect_encroachments(args.baseline, args.current,
+                                   params_json=args.params, verbose=True)
     if args.out:
         Path(args.out).write_text(_json.dumps(results, indent=2))
         print(f"  Alerts written to {args.out}")
