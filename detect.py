@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import rasterio
 import rasterio.transform
+from scipy import ndimage
 
 
 # =============================================================================
@@ -124,40 +125,27 @@ def _get_rf_model():
 # 2. CONNECTED-COMPONENT CLUSTERING  (unchanged)
 # =============================================================================
 
-def _neighbors_8(r: int, c: int, rows: int, cols: int) -> List[Tuple[int, int]]:
-    out = []
-    for dr in (-1, 0, 1):
-        for dc in (-1, 0, 1):
-            if dr == 0 and dc == 0:
-                continue
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < rows and 0 <= nc < cols:
-                out.append((nr, nc))
-    return out
-
-
 def find_clusters(mask: np.ndarray) -> Tuple[np.ndarray, Dict[int, int]]:
-    """Label 8-connected components; return (label_map, {label: size})."""
-    rows, cols = mask.shape
-    labels = np.zeros_like(mask, dtype=np.int32)
-    current_label = 0
-    sizes: Dict[int, int] = {}
-    for r in range(rows):
-        for c in range(cols):
-            if mask[r, c] and labels[r, c] == 0:
-                current_label += 1
-                stack = [(r, c)]
-                size = 0
-                while stack:
-                    cr, cc = stack.pop()
-                    if labels[cr, cc] != 0:
-                        continue
-                    labels[cr, cc] = current_label
-                    size += 1
-                    for nr, nc in _neighbors_8(cr, cc, rows, cols):
-                        if mask[nr, nc] and labels[nr, nc] == 0:
-                            stack.append((nr, nc))
-                sizes[current_label] = size
+    """
+    Label 8-connected components; return (label_map, {label: size}).
+
+    Vectorized with scipy.ndimage.label (same 8-connectivity as the
+    original pure-Python flood-fill, just implemented in C). The old
+    row-by-row Python loop was fine for small prototype rasters but
+    doesn't scale to full-resolution GEE downloads, which can be tens
+    of millions of pixels for large regions (e.g. Amazon Basin).
+    """
+    structure = np.ones((3, 3), dtype=int)  # 8-connectivity (incl. diagonals)
+    labels, num_features = ndimage.label(mask, structure=structure)
+    labels = labels.astype(np.int32)
+
+    if num_features == 0:
+        return labels, {}
+
+    counts = np.bincount(labels.ravel())
+    sizes: Dict[int, int] = {
+        lbl: int(counts[lbl]) for lbl in range(1, num_features + 1)
+    }
     return labels, sizes
 
 
@@ -183,15 +171,24 @@ class ClusterFeatures:
     bbox_area: int
 
 
-def _extract_features(label_map: np.ndarray, lbl: int,
-                      delta: np.ndarray) -> ClusterFeatures:
+def _extract_features(label_map: np.ndarray, lbl: int, delta: np.ndarray,
+                       row_offset: int = 0, col_offset: int = 0) -> ClusterFeatures:
+    """
+    label_map / delta are expected to already be cropped to this cluster's
+    bounding box (see detect_encroachments, which uses
+    scipy.ndimage.find_objects so it doesn't rescan the full raster once
+    per cluster — that used to be O(num_clusters * raster_size), which is
+    fine for a small test raster but grinds to a halt on a real multi-
+    million-pixel GEE download). row_offset/col_offset translate the local
+    (cropped) coordinates back to the full raster's coordinate space.
+    """
     pixels  = np.argwhere(label_map == lbl)
     rows_px = pixels[:, 0]
     cols_px = pixels[:, 1]
     size    = len(pixels)
 
-    cr = int(rows_px.mean())
-    cc = int(cols_px.mean())
+    cr = int(rows_px.mean()) + row_offset
+    cc = int(cols_px.mean()) + col_offset
 
     vals   = delta[rows_px, cols_px]
     d_mean = float(vals.mean())
@@ -392,9 +389,22 @@ def detect_encroachments(
     unique_labels = [lbl for lbl, sz in cluster_sizes.items()
                      if sz >= params.size_min_valid]
 
+    # One O(raster_size) pass to get every cluster's bounding box, instead
+    # of rescanning the full raster inside _extract_features per cluster.
+    bboxes = ndimage.find_objects(labels)
+
     alerts = []
     for lbl in unique_labels:
-        features = _extract_features(labels, lbl, delta)
+        bbox = bboxes[lbl - 1]
+        if bbox is None:
+            continue
+        row_slice, col_slice = bbox
+        local_labels = labels[row_slice, col_slice]
+        local_delta  = delta[row_slice, col_slice]
+        features = _extract_features(
+            local_labels, lbl, local_delta,
+            row_offset=row_slice.start, col_offset=col_slice.start,
+        )
         category, severity, confidence, raw_scores = classify_cluster(features, params)
         lon, lat = rasterio.transform.xy(transform, features.centroid_row, features.centroid_col)
         alerts.append({
