@@ -253,6 +253,24 @@ REGION_COORDS = {
     "Black Forest, Germany":          [48.2,    8.1],
 }
 
+# Real query bounds — must mirror gee_export.FOREST_REGIONS exactly
+# (min_lon, min_lat, max_lon, max_lat). Used to draw the actual scanned
+# area on the map instead of a fixed decorative box, since some regions
+# (e.g. Amazon Basin) are far larger than a fixed radius would suggest.
+REGION_BOUNDS = {
+    "Western Ghats, India":           (74.0, 8.0, 78.5, 15.5),
+    "Aravalli Hills, India":          (72.5, 23.5, 77.5, 28.5),
+    "Amazon Basin, Brazil":           (-73.0, -10.0, -44.0, 5.0),
+    "Borneo Rainforest":              (108.0, -4.5, 119.0, 7.0),
+    "Congo Basin, Africa":            (15.0, -5.0, 30.0, 5.0),
+    "Sundarbans, Bangladesh":         (88.5, 21.5, 90.0, 22.5),
+    "Daintree Rainforest, Australia": (145.2, -16.5, 145.7, -15.8),
+    "Black Forest, Germany":          (7.5, 47.5, 8.5, 48.8),
+    "Tongass National Forest, USA":   (-136.0, 54.5, -129.0, 60.0),
+    "Atlantic Forest, Brazil":        (-50.0, -25.0, -35.0, -10.0),
+    "Northeast India Forests":        (89.5, 21.5, 97.5, 29.0),
+}
+
 # Sidebar
 with st.sidebar:
     st.markdown('<div class="section-title">Forest Region</div>', unsafe_allow_html=True)
@@ -323,12 +341,18 @@ center = REGION_COORDS.get(region, [12.0, 76.5])
 map_tiles = "CartoDB dark_matter" if is_dark else "CartoDB positron"
 m = folium.Map(location=center, zoom_start=6, tiles=map_tiles, prefer_canvas=True)
 
+min_lon, min_lat, max_lon, max_lat = REGION_BOUNDS.get(
+    region, (center[1] - 3, center[0] - 3, center[1] + 3, center[0] + 3)
+)
+box_bounds = [[min_lat, min_lon], [max_lat, max_lon]]
+
 folium.Rectangle(
-    bounds=[[center[0]-3, center[1]-3], [center[0]+3, center[1]+3]],
+    bounds=box_bounds,
     color="#2dd4a0", weight=1.5, fill=True,
     fill_color="#2dd4a0", fill_opacity=0.04,
-    tooltip="Protected forest boundary",
+    tooltip="Protected forest boundary (actual satellite query area)",
 ).add_to(m)
+m.fit_bounds(box_bounds)
 
 # Scan and alert rendering
 if scan:
