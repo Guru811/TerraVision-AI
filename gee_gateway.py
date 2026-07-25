@@ -1,4 +1,5 @@
 import os
+import json
 import ee
 from dotenv import load_dotenv
 
@@ -6,29 +7,56 @@ from dotenv import load_dotenv
 # On Streamlit Cloud, these come from the Secrets manager instead
 load_dotenv()
 
+
+def _get_secret(key: str):
+    """
+    Look up a config value from, in order:
+    1. Streamlit Secrets (when running inside a deployed Streamlit app)
+    2. Environment variables (.env file when running locally)
+    """
+    try:
+        import streamlit as st
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key)
+
+
 def connect_gee():
     """
-    Initialises Google Earth Engine using a project ID stored in an
-    environment variable. This keeps the project ID out of the source code
-    so it is safe to push the code to a public GitHub repository.
+    Initialises Google Earth Engine.
 
-    Locally: reads GEE_PROJECT_ID from the .env file
-    Streamlit Cloud: reads GEE_PROJECT_ID from the Streamlit Secrets panel
+    Cloud (Streamlit Secrets): authenticates as a service account using
+    GEE_SERVICE_ACCOUNT_JSON (the full JSON key, pasted as one secret) plus
+    GEE_PROJECT_ID. No browser login needed, so this works headless.
+
+    Local (.env): falls back to the credentials cached by running
+    `earthengine authenticate` once on your machine. Only GEE_PROJECT_ID
+    is needed in that case.
     """
-    project_id = os.getenv("GEE_PROJECT_ID")
-
+    project_id = _get_secret("GEE_PROJECT_ID")
     if not project_id:
         raise ValueError(
             "GEE_PROJECT_ID not found. "
             "Create a .env file locally or add it to Streamlit Secrets."
         )
 
+    service_account_json = _get_secret("GEE_SERVICE_ACCOUNT_JSON")
+
     try:
-        # ee.Authenticate() is not called here because authentication
-        # is done once manually on each machine using the CLI.
-        # On Streamlit Cloud, a service account is used instead (see README).
-        ee.Initialize(project=project_id)
-        print(f"Connected to Earth Engine project: {project_id}")
+        if service_account_json:
+            key_dict = json.loads(service_account_json)
+            credentials = ee.ServiceAccountCredentials(
+                key_dict["client_email"], key_data=service_account_json
+            )
+            ee.Initialize(credentials, project=project_id)
+            print(f"Connected to Earth Engine as service account: {key_dict['client_email']}")
+        else:
+            # ee.Authenticate() is not called here because authentication
+            # is done once manually on each machine using the CLI.
+            ee.Initialize(project=project_id)
+            print(f"Connected to Earth Engine project: {project_id}")
     except Exception as e:
         raise RuntimeError(f"Earth Engine initialisation failed: {e}")
 
