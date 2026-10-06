@@ -338,8 +338,17 @@ with col_btn:
 
 # Map setup
 center = REGION_COORDS.get(region, [12.0, 76.5])
-map_tiles = "CartoDB dark_matter" if is_dark else "CartoDB positron"
-m = folium.Map(location=center, zoom_start=6, tiles=map_tiles, prefer_canvas=True)
+if is_dark:
+    tile_url = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
+else:
+    tile_url = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}"
+
+m = folium.Map(location=center, zoom_start=6, tiles=None, prefer_canvas=True)
+folium.TileLayer(
+    tiles=tile_url,
+    attr="Tiles © Esri — Esri, HERE, Garmin, OpenStreetMap contributors",
+    max_zoom=16,
+).add_to(m)
 
 min_lon, min_lat, max_lon, max_lat = REGION_BOUNDS.get(
     region, (center[1] - 3, center[0] - 3, center[1] + 3, center[0] + 3)
